@@ -1,5 +1,7 @@
 # Tavily Key Generator - Rebuilt Edition
 
+[English Guide](./README_EN.md)
+
 完全重构版 Tavily 自动注册工具。
 
 这版不再依赖早期那种不稳定的旧脚本链路，而是统一切到：
