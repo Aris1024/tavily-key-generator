@@ -1,136 +1,238 @@
 # Cloudflare Mail Setup Guide
 
-This guide focuses on one thing only:
+[中文版](./Cloudflare%E9%82%AE%E4%BB%B6%E8%AE%BE%E7%BD%AE%E8%AF%A6%E8%A7%A3.md)
 
-how to set up `Cloudflare domain mail + a simple mail API` so it works smoothly with our `tavily-key-generator`.
+Universal edition: how to build a reusable “unlimited alias domain mail” setup with Cloudflare Email Routing, Catch-all, and Email Workers.
 
-If you want the shortest possible summary first, remember this:
+> In this guide, “unlimited domain mail” really means “unlimited alias-style mailboxes on your own domain”.
+> In other words, you do not have to pre-create every mailbox account one by one.
+> You can still receive mail sent to arbitrary random addresses under your domain.
 
-> Cloudflare receives the mail. Our own API exposes the mail content to the project.
+This guide was cross-checked against Cloudflare’s official documentation on `2026-03-16`.
 
 ---
 
-## 1. What the project actually needs
+## 1. Who this guide is for
 
-It is easy to misunderstand the Cloudflare flow at first.
+This guide is not only for `tavily-key-generator`.
 
-A lot of people assume one of these:
+It is useful if you want to:
 
-- the project talks directly to a built-in Cloudflare inbox API
-- once Email Routing is enabled in Cloudflare, the project can read messages automatically
+- turn your own domain into an “unlimited alias” receiving endpoint
+- receive verification codes, login links, and confirmation emails without creating many mailbox accounts
+- connect domain mail to scripts, automation, or test environments
+- forward mail to Gmail, Outlook, or a business inbox
+- build your own mail API so programs can query message content over HTTP
 
-Neither is true for our current implementation.
+If you only want simple forwarding, this guide works.  
+If you want a programmable mail pipeline, this guide also works.
 
-What the project really does is:
+---
 
-1. generate a random mailbox such as `tavily-ab12cd34@tvmail.example.com`
-2. use that mailbox during Tavily signup
-3. wait for Tavily to send the verification email
-4. poll your own mail API:
+## 2. What “unlimited domain mail” really means
+
+People often misunderstand this phrase.
+
+It does **not** mean:
+
+1. Cloudflare gives you an unlimited number of full traditional mailbox accounts
+2. Cloudflare gives you a built-in inbox UI like Gmail
+
+What it really means is:
+
+### you can receive mail sent to practically unlimited random addresses under your domain, without manually creating each mailbox first
+
+For example:
 
 ```text
-GET {EMAIL_API_URL}/messages?address=random-mailbox
-Authorization: Bearer {EMAIL_API_TOKEN}
+anything-1@example.com
+signup-abc@example.com
+tavily-x8y9z0@example.com
+notify-order-123@example.com
 ```
 
-Then it reads:
+You do not need to pre-create all of these addresses individually.
 
-- `subject`
-- `text`
-- `html`
+You only need:
 
-and extracts the 6-digit code.
+1. Cloudflare Email Routing
+2. Catch-all
+3. a final destination or processing layer
 
-So the project needs two separate capabilities:
+That said, it is still not literally infinite in a platform-level sense.
 
-1. **a way to receive mail for your domain**
-2. **a way to read that mail over HTTP**
+According to Cloudflare’s official docs as of `2026-03-16`, you still need to keep in mind:
 
-Cloudflare solves the first part very well.  
-We add a thin API layer for the second part.
+- a default limit of `200` routing rules
+- a default limit of `200` addresses
+- a current message size limit of `25 MiB`
+- Worker resource limits if you process mail through Email Workers
+
+If those defaults are not enough, Cloudflare also documents a limit-increase request path.
+
+So the key advantage is not “no limits anywhere”.
+
+The real advantage is:
+
+### you no longer need to manually maintain hundreds or thousands of actual mailbox accounts
 
 ---
 
-## 2. The recommended architecture
+## 3. What this setup is good for
 
-The whole flow should look like this:
+This setup works very well for:
 
-```text
-Tavily sends the verification email
-        ↓
-tavily-random-string@your-domain
-        ↓
-Cloudflare Email Routing receives it
-        ↓
-Catch-all rule matches
-        ↓
-Mail is sent to an Email Worker
-        ↓
-The Worker parses the message and stores it in D1
-        ↓
-Our project requests /messages?address=...
-        ↓
-The project reads the message and extracts the code
-```
+- verification-code mailboxes
+- automated signup flows
+- QA and test environments
+- notification aggregation
+- service-specific alias addresses
+- internal tooling
+- disposable or semi-disposable mail pipelines
 
-Each layer has a single job:
+It is **not** a full replacement for a traditional business mailbox platform if you need:
 
-- `Email Routing` receives mail
-- `Worker` processes mail
-- `D1` stores mail
-- `API` returns mail to the project
+- inbox and sent-mail UI
+- drafts
+- a full per-user mailbox product
+- standard IMAP / POP3 mailbox behavior for humans
 
----
-
-## 3. Why a subdomain is usually the safest choice
-
-If your main domain is already used by a real mailbox provider such as:
+For that, you would still want a dedicated mail provider such as:
 
 - Google Workspace
+- Microsoft 365
 - Zoho Mail
-- Outlook / Microsoft 365
-- any other business mail service
+- Fastmail
 
-then the safest option is:
+Cloudflare Email Routing is best thought of as:
 
-**do not reuse the same mail domain for this automation flow.**
+**a powerful inbound mail routing and processing layer**
 
-Instead, create a dedicated subdomain such as:
+not a complete mailbox product.
 
-- `tvmail.example.com`
-- `keys.example.com`
-- `verify.example.com`
+Cloudflare’s docs also explicitly state:
+
+### Email Routing does not process outbound email and does not provide an SMTP server.
+
+So if you need sending capability, you still need a separate outbound mail solution.
+
+---
+
+## 4. The two main architecture options
+
+There are two practical ways to use this system.
+
+### Mode A: Simple forwarding
+
+Best for personal or lightweight use.
+
+```text
+Mail sent to your domain
+        ↓
+Cloudflare Email Routing
+        ↓
+Forwarded to Gmail / Outlook / business inbox
+```
+
+Pros:
+
+- fastest to set up
+- no code required
+- great for normal subscriptions and registration mail
+
+Cons:
+
+- weak automation story
+- not convenient for direct programmatic access
+- less flexible for code extraction and custom routing logic
+
+### Mode B: Worker automation mode
+
+Best for developers and automation-heavy workflows.
+
+```text
+Mail sent to your domain
+        ↓
+Cloudflare Email Routing
+        ↓
+Catch-all matches
+        ↓
+Email Worker processes the message
+        ↓
+D1 / KV / R2 / Webhook / your API
+        ↓
+your project or automation reads the result
+```
+
+Pros:
+
+- perfect for automation
+- easy to turn into a mail API
+- ideal for extracting OTP codes, links, and structured data
+- easy to integrate with dashboards, scripts, and internal systems
+
+Cons:
+
+- requires a small amount of Worker code
+- requires basic understanding of D1 or API design
+
+If you only need normal mail forwarding, choose Mode A.  
+If you want programs to consume mail, choose Mode B.
+
+---
+
+## 5. Main domain or subdomain?
+
+This decision matters more than it looks.
+
+### Best practice: use a dedicated subdomain
+
+For example:
+
+- `mail.example.com`
+- `notify.example.com`
+- `signup.example.com`
+- `box.example.com`
 
 Why this is better:
 
-1. it does not interfere with your normal business mail
-2. the DNS and routing setup stays much cleaner
-3. troubleshooting becomes much easier
+1. it avoids interfering with your main domain
+2. the DNS setup stays cleaner
+3. it is easier to troubleshoot
+4. it fits automation-specific use cases much better
 
-In practice, this setup works best:
+### Do not force this onto a domain already running another mail service
 
-- your main domain stays untouched for normal mail
-- your subdomain is used only for `tavily-key-generator`
+Cloudflare’s docs are clear: when Email Routing is active for the configured domain, other active MX-based mail services on that same configured domain will conflict with it.
+
+So if your main domain already uses:
+
+- Google Workspace
+- Microsoft 365
+- another enterprise mail provider
+
+the safest option is:
+
+**create a dedicated subdomain for this purpose**
 
 ---
 
-## 4. What you should prepare first
+## 6. What you need before starting
 
-Before you start, make sure you have:
+Prepare the following:
 
 1. a domain already managed by Cloudflare
 2. access to the Cloudflare Dashboard
-3. a chosen domain or subdomain for verification emails
-4. willingness to deploy one small Cloudflare Worker
-5. `node`, `npm`, and `wrangler` available locally
+3. a chosen domain or subdomain
+4. if you want automation mode, local access to `node`, `npm`, and `wrangler`
 
-If `wrangler` is not installed yet:
+If `wrangler` is not installed:
 
 ```bash
 npm install -g wrangler
 ```
 
-Then log in:
+Then authenticate:
 
 ```bash
 wrangler login
@@ -138,29 +240,7 @@ wrangler login
 
 ---
 
-## 5. Step 1: Put your domain or subdomain on Cloudflare
-
-If your domain is not on Cloudflare yet:
-
-1. log in to Cloudflare
-2. click `Add a site`
-3. add your domain
-4. update the nameservers
-5. wait until the zone becomes `Active`
-
-If the domain is already managed by Cloudflare, you can move on.
-
-If you want to use a dedicated subdomain, decide on it now. For example:
-
-```text
-tvmail.example.com
-```
-
-This exact value will later become your `EMAIL_DOMAIN`.
-
----
-
-## 6. Step 2: Enable Email Routing
+## 7. Step 1: Enable Email Routing
 
 Open:
 
@@ -171,167 +251,358 @@ Cloudflare Dashboard
 -> Email Routing
 ```
 
-The first time you open it, Cloudflare usually shows a setup flow.
+The first time you use it, Cloudflare will guide you through enabling Email Routing.
 
-Follow it and let Cloudflare enable Email Routing and add the required DNS records.
+The core actions are:
 
-These records usually include:
+1. enable Email Routing
+2. let Cloudflare add the required DNS records
+
+This usually involves:
 
 - `MX`
 - `TXT`
 
-Pay attention to these points:
+### Three common problems here
 
-### 1. Avoid existing MX conflicts
+#### 1. Existing MX conflicts
 
-If the same domain is already being used by another mail provider, Cloudflare may report a conflict.
+If the domain already uses another mail provider, Cloudflare will usually warn you.
 
-In plain language:
+If you keep the conflicting MX records, Email Routing usually will not work properly.
 
-- if the domain already runs a normal mailbox service, do not force this setup onto it
-- a dedicated subdomain is usually the cleanest solution
+#### 2. SPF conflicts
 
-### 2. Fix SPF warnings early
+If Cloudflare reports SPF issues, fix them early.
 
-If Cloudflare shows SPF problems, do not ignore them.
+Multiple SPF records are a common source of mail-routing trouble.
 
-A domain should normally have one valid SPF entry path.  
-Multiple SPF records often lead to delivery or verification issues.
+#### 3. Manual edits to Cloudflare-managed mail DNS
 
-### 3. Leave Cloudflare-managed Email Routing DNS records alone
-
-Once Email Routing is enabled and working, avoid manually editing the mail records Cloudflare created for it.
+Once Cloudflare creates the mail-related DNS records for Email Routing, avoid manually editing them unless you really know why.
 
 ---
 
-## 7. Step 3: Enable Catch-all
+## 8. Step 2: If you want a subdomain, add it first
 
-This is the most important step for our project.
-
-Why?
-
-Because our project does not use one fixed mailbox.  
-It creates random addresses like:
+If you want to use something like:
 
 ```text
-tavily-a1b2c3d4@tvmail.example.com
-tavily-z9y8x7w6@tvmail.example.com
+signup.example.com
 ```
 
-You cannot pre-create every possible mailbox by hand.
+instead of the zone apex domain, first add that subdomain to Email Routing.
 
-The correct approach is:
+Path:
 
-**enable Catch-all so every random address can be received.**
+```text
+Email
+-> Email Routing
+-> Settings
+-> Add subdomain
+```
 
-How to do it:
+Once this is done, Routing Rules will let you choose between:
 
-1. go to `Email Routing`
-2. open `Routes`
-3. find `Catch-all address`
-4. enable it
-5. set the action to send mail to a `Worker`
-
-Once Catch-all is active, every address on that domain without a dedicated route will still be handled.
-
-That is exactly what this project needs.
+- the top-level zone domain
+- any configured Email Routing subdomain
 
 ---
 
-## 8. Step 4: Send mail to a Worker, not to a normal mailbox
+## 9. Step 3: Understand the three key concepts
 
-Cloudflare Email Routing gives you different action types, for example:
+Cloudflare Email Routing becomes much easier once these three concepts are clear.
 
-- forward to a normal mailbox
+### 1. Custom address
+
+This is an explicitly created address rule, for example:
+
+```text
+info@example.com
+news@example.com
+verify@example.com
+```
+
+Use this when you know the exact fixed addresses you want.
+
+### 2. Catch-all
+
+This is the most important part for the “unlimited alias” setup.
+
+Its job is:
+
+**to catch addresses that do not have explicit rules**
+
+This is what makes large numbers of random addresses practical.
+
+Instead of creating:
+
+```text
+a1@example.com
+a2@example.com
+a3@example.com
+random-1@example.com
+random-2@example.com
+```
+
+one by one, Catch-all lets one route handle them all.
+
+### 3. Subaddressing (plus addressing)
+
+Cloudflare now supports addresses like:
+
+```text
+user+tag@example.com
+```
+
+This is useful when you want a single existing address plus a dynamic tag.
+
+For example:
+
+```text
+newsletter+reddit@example.com
+newsletter+github@example.com
+```
+
+This is helpful for source labeling, but it is not a replacement for Catch-all.
+
+In short:
+
+- use Catch-all for arbitrary random local-parts
+- use Subaddressing to add tags to an existing base address
+
+---
+
+## 10. Step 4: Decide where the mail should go
+
+At the end of the routing chain, you normally choose one of two destinations.
+
+### Option A: Forward to a real mailbox
+
+Such as:
+
+- Gmail
+- Outlook
+- a business mailbox
+
+This is the simplest route:
+
+```text
+Custom address / Catch-all
+-> Forward to verified destination address
+```
+
+Good for:
+
+- normal receiving
+- personal alias mail
+- website registrations
+- newsletter routing
+
+### Option B: Send to an Email Worker
+
+This is better for automation and integration work:
+
+```text
+Custom address / Catch-all
+-> Send to Email Worker
+```
+
+Good for:
+
+- OTP extraction
+- verification-link parsing
+- building a mail API
+- database storage
+- webhook delivery
+- project integrations
+
+If your real goal is “let code read the mail”, choose the Worker route.
+
+---
+
+## 11. Step 5: Enable Catch-all
+
+Go to:
+
+```text
+Email
+-> Email Routing
+-> Routes
+```
+
+Find `Catch-all address`.
+
+Then:
+
+1. turn it on so it becomes `Active`
+2. choose the action
+3. save
+
+The action can be:
+
+- forward to a destination address
 - send to a Worker
 
-For our project, the best option is:
+### Recommended patterns
 
-**send mail directly to a Worker.**
+If you only want all random aliases to land in Gmail:
 
-Why this is better:
+```text
+Catch-all -> Forward to Gmail
+```
 
-- no IMAP or POP3 setup is needed
-- no mailbox login automation is needed
-- delays are lower
-- the data shape stays under our control
-
-So the most practical route is:
+If you want a programmable mail system:
 
 ```text
 Catch-all -> Send to Worker
 ```
 
+This is the key step behind the “unlimited alias domain mail” workflow.
+
 ---
 
-## 9. Step 5: Create a dedicated mail Worker project
+## 12. Step 6: How to configure the simple forwarding mode
 
-Run this locally:
+If you only want your domain mail forwarded to a normal mailbox, this is the shortest path.
+
+### Setup flow
+
+1. enable Email Routing
+2. add a destination address
+3. verify that destination
+4. create a Custom address or enable Catch-all
+5. choose `Forward`
+6. select the verified destination mailbox
+
+### Example
+
+You might set up:
+
+```text
+newsletter@example.com -> yourname@gmail.com
+billing@example.com -> yourname@gmail.com
+Catch-all@example.com -> yourname@gmail.com
+```
+
+Then mail sent to:
+
+```text
+anything@example.com
+signup-test@example.com
+random-2026@example.com
+```
+
+can all end up in your Gmail.
+
+### Who this mode is for
+
+Good for:
+
+- general mail receiving
+- website signups
+- subscription management
+- personal alias routing
+
+Not ideal for:
+
+- automatic code extraction
+- direct programmatic mail access
+- mail APIs
+
+---
+
+## 13. Step 7: How to configure the automation mode
+
+If you want code to read incoming messages directly, use this path.
+
+Recommended structure:
+
+```text
+Cloudflare Email Routing
+        ↓
+Catch-all
+        ↓
+Email Worker
+        ↓
+D1 / KV / R2 / Webhook / API
+        ↓
+your project or automation
+```
+
+The most practical default design is:
+
+- `Email Worker` receives the message
+- `D1` stores the parsed content
+- `fetch()` exposes an HTTP API
+
+This is the most reusable general-purpose design.
+
+---
+
+## 14. Step 8: Create a generic mail Worker
+
+Run locally:
 
 ```bash
-npm create cloudflare@latest tavily-mail-api
-cd tavily-mail-api
+npm create cloudflare@latest mail-gateway-api
+cd mail-gateway-api
 npm i postal-mime
 ```
 
-We use `postal-mime` because Cloudflare gives the Worker a raw email message.  
-We want to parse it into a structure that is easy for the project to consume:
+Why `postal-mime`?
 
-- subject
-- plain text
-- HTML
+Cloudflare hands the Worker a raw email message.  
+Most automation flows want a parsed structure like:
+
+- `subject`
+- `text`
+- `html`
+- `from`
+- `to`
 
 ---
 
-## 10. Step 6: Create a D1 database
+## 15. Step 9: Create a D1 database
 
 Create the database:
 
 ```bash
-npx wrangler d1 create tavily_mail
+npx wrangler d1 create mail_gateway
 ```
 
-Save the returned `database_id`.  
-You will need it in `wrangler.toml`.
+Save the returned `database_id`.
 
 Then create `schema.sql`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
-  address TEXT NOT NULL,
+  message_to TEXT NOT NULL,
+  message_from TEXT,
   subject TEXT,
   text TEXT,
   html TEXT,
   received_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_address_time
-ON messages(address, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_to_time
+ON messages(message_to, received_at DESC);
 ```
 
-Apply the schema:
+Apply it:
 
 ```bash
-npx wrangler d1 execute tavily_mail --file=schema.sql
+npx wrangler d1 execute mail_gateway --file=schema.sql
 ```
 
-This table is enough for the current project flow.
-
-Field meanings:
-
-- `id`: unique message identifier
-- `address`: recipient address, the random mailbox generated by the project
-- `subject`: email subject
-- `text`: plain-text body
-- `html`: HTML body
-- `received_at`: receive timestamp, used for ordering
+This schema is enough for most OTP, signup, and notification scenarios.
 
 ---
 
-## 11. Step 7: Add the Worker code
+## 16. Step 10: Minimal Worker example
 
-Put this minimal implementation in `src/index.ts`:
+Put this in `src/index.ts`:
 
 ```ts
 import PostalMime from "postal-mime";
@@ -359,12 +630,13 @@ export default {
 
     await env.DB.prepare(
       `INSERT OR REPLACE INTO messages
-       (id, address, subject, text, html, received_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`
+       (id, message_to, message_from, subject, text, html, received_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`
     )
       .bind(
         id,
         String(message.to).toLowerCase(),
+        parsed.from?.address || "",
         parsed.subject || "",
         parsed.text || "",
         typeof parsed.html === "string" ? parsed.html : "",
@@ -382,18 +654,14 @@ export default {
 
     if (req.method === "GET" && url.pathname === "/messages") {
       const address = (url.searchParams.get("address") || "").trim().toLowerCase();
-
       if (!address) {
-        return Response.json(
-          { error: "missing address" },
-          { status: 400 }
-        );
+        return Response.json({ error: "missing address" }, { status: 400 });
       }
 
       const result = await env.DB.prepare(
-        `SELECT id, subject, text, html, received_at
+        `SELECT id, message_to, message_from, subject, text, html, received_at
          FROM messages
-         WHERE address = ?1
+         WHERE message_to = ?1
          ORDER BY received_at DESC
          LIMIT 20`
       )
@@ -401,13 +669,7 @@ export default {
         .all();
 
       return Response.json({
-        messages: (result.results || []).map((row: any) => ({
-          id: row.id,
-          subject: row.subject || "",
-          text: row.text || "",
-          html: row.html || "",
-          received_at: row.received_at,
-        })),
+        messages: result.results || [],
       });
     }
 
@@ -416,67 +678,55 @@ export default {
 };
 ```
 
-This code does only two things:
+This code does two things:
 
 ### `email()`
 
-When Cloudflare receives a message, it calls this handler.  
-We parse the message and save it to D1.
+Cloudflare calls this when a message arrives.  
+We parse it and store it in D1.
 
 ### `fetch()`
 
-When our project requests:
+Your scripts or applications can call:
 
 ```text
-/messages?address=some-random-mailbox
+GET /messages?address=xxx@example.com
 ```
 
-we return the latest messages for that address from D1.
+to read the latest mail for a specific alias address.
 
 ---
 
-## 12. Step 8: Configure `wrangler.toml`
+## 17. Step 11: Configure `wrangler.toml`
 
 Use a minimal config like this:
 
 ```toml
-name = "tavily-mail-api"
+name = "mail-gateway-api"
 main = "src/index.ts"
 compatibility_date = "2026-03-16"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "tavily_mail"
-database_id = "replace-with-your-d1-database-id"
+database_name = "mail_gateway"
+database_id = "replace-with-your-database-id"
 ```
 
-Then set your own API token secret:
+Then create a Bearer token for the API:
 
 ```bash
 npx wrangler secret put API_TOKEN
 ```
 
-Use a long random string, for example:
+Use a long random string.
 
-```text
-your-super-long-random-token
-```
+Its purpose is simple:
 
-This point is extremely important:
-
-**this `API_TOKEN` is what you put into the project's `EMAIL_API_TOKEN`.**
-
-It is **not**:
-
-- a Cloudflare Global API Key
-- a Cloudflare account token
-- a Zone API token
-
-It is only the Bearer token for your own Worker API.
+**protect your mail-reading API from unauthorized access**
 
 ---
 
-## 13. Step 9: Deploy the Worker
+## 18. Step 12: Deploy the Worker
 
 Run:
 
@@ -484,23 +734,26 @@ Run:
 npx wrangler deploy
 ```
 
-After deployment, you will get a URL that looks like:
+You will usually get a URL like:
 
 ```text
-https://tavily-mail-api.xxx.workers.dev
+https://mail-gateway-api.xxx.workers.dev
 ```
 
-That URL becomes your:
+This URL can now be used by:
 
-```env
-EMAIL_API_URL=...
-```
+- scripts
+- projects
+- dashboards
+- internal tools
+
+to query mail content.
 
 ---
 
-## 14. Step 10: Route Catch-all to the Worker
+## 19. Step 13: Point Cloudflare Routing to the Worker
 
-Go back to Cloudflare:
+Now go back to Cloudflare:
 
 ```text
 Email
@@ -508,300 +761,287 @@ Email
 -> Routes
 ```
 
-Find `Catch-all address` and set its action to:
+Choose either:
+
+- a Custom address
+- or Catch-all
+
+Set the `Action` to:
 
 ```text
 Send to a Worker
 ```
 
-Then select the Worker you just deployed.
+Then select the Worker you deployed.
 
-At this point, the receiving flow is complete:
+At this point the pipeline is complete:
 
 ```text
-mail sent to any random address
+mail sent to arbitrary alias address
 -> Cloudflare Catch-all matches
--> Worker receives it
--> Worker stores it in D1
--> the project reads it via /messages
+-> Email Worker receives it
+-> D1 stores it
+-> API returns it
 ```
 
 ---
 
-## 15. Step 11: Fill in the project's `.env`
+## 20. Four practical use cases
 
-If you only use one domain:
+### Use case 1: registration-only domain mail
 
-```env
-EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=the-api-token-you-created
-EMAIL_DOMAIN=tvmail.example.com
-```
-
-If you want multiple domains and runtime selection:
-
-```env
-EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=the-api-token-you-created
-EMAIL_DOMAINS=tvmail.example.com,keys.example.com
-```
-
-Here is what each variable means:
-
-### `EMAIL_PROVIDER`
-
-Always set:
+For example, use:
 
 ```text
-cloudflare
+signup.example.com
 ```
 
-This tells the project to use the Cloudflare domain mail flow.
-
-### `EMAIL_API_URL`
-
-This must be your Worker API URL.
-
-It is **not** a Cloudflare dashboard API endpoint.
-
-### `EMAIL_API_TOKEN`
-
-This must be your own Worker Bearer token.
-
-It is **not** a Cloudflare platform key.
-
-### `EMAIL_DOMAIN`
-
-This is the mail domain suffix, for example:
+Then register services with random aliases such as:
 
 ```text
-tvmail.example.com
+reddit-001@signup.example.com
+github-002@signup.example.com
+shop-003@signup.example.com
 ```
 
-The project will generate addresses like:
+Why this is useful:
+
+- your real mailbox stays hidden
+- the alias itself tells you where it was used
+- leaks become easier to trace
+
+### Use case 2: automated OTP mailboxes
+
+Perfect for:
+
+- signup bots
+- test environments
+- QA verification flows
+
+Best pattern:
 
 ```text
-tavily-random-string@tvmail.example.com
+Catch-all -> Worker -> API
 ```
 
-### `EMAIL_DOMAINS`
+Your code reads the API directly, without opening a mailbox UI.
 
-If you provide multiple domains, the launcher can let you choose one at runtime.
+### Use case 3: internal notification intake
+
+You can assign different aliases to different notification sources:
+
+```text
+billing@notify.example.com
+alarm@notify.example.com
+backup@notify.example.com
+```
+
+Then let the Worker route them by sender, subject, or downstream system.
+
+### Use case 4: disposable mailbox infrastructure
+
+You can extend the Worker with:
+
+- automatic expiration
+- scheduled cleanup
+- retention windows
+- allowed-sender checks
+
+This lets you build your own disposable-mail platform on top of the same foundation.
 
 ---
 
-## 16. How mailbox generation works in this project
+## 21. How to test the setup
 
-This detail matters a lot during setup.
+Use this order.
 
-The project does not log in to one fixed mailbox.  
-Instead, it generates random addresses such as:
+### Test 1: send one manual test email
 
-```text
-tavily-abcdefgh@tvmail.example.com
-```
-
-That means:
-
-- you do not need to pre-create each mailbox
-- you do not need to add mailboxes one by one
-- you only need Catch-all to receive every random address
-
-This is why Catch-all is mandatory for this setup.
-
----
-
-## 17. Step 12: Test the flow before running the project
-
-Do not jump straight into the full registration flow yet.
-
-It is much safer to validate the mail pipeline first.
-
-### Test 1: Send one manual test email
-
-Pick a random address that should match Catch-all, for example:
+Pick an address that should match Catch-all, for example:
 
 ```text
-test-123@tvmail.example.com
+test-123@signup.example.com
 ```
 
-Send an email to it from another mailbox.
+Send a message to it from another mailbox.
 
-### Test 2: Query the API with `curl`
+Cloudflare officially recommends not sending the test from the same destination mailbox to itself, because some providers may treat it as a duplicate and hide it.
+
+### Test 2: for simple forwarding mode
+
+Check whether the destination inbox actually received the message.
+
+### Test 3: for Worker automation mode
+
+Query the API:
 
 ```bash
-curl -H "Authorization: Bearer your-api-token" \
-  "https://tavily-mail-api.xxx.workers.dev/messages?address=test-123@tvmail.example.com"
+curl -H "Authorization: Bearer your-token" \
+  "https://mail-gateway-api.xxx.workers.dev/messages?address=test-123@signup.example.com"
 ```
 
-If you see:
-
-- `messages`
-- `subject`
-- `text`
-- `html`
-
-then the mail path is working.
-
-### Test 3: Run the project
-
-```bash
-python3 run.py
-```
-
-If the verification-code step continues automatically, the full Cloudflare mail setup is working.
+If you get a `messages` array back, the flow is working.
 
 ---
 
-## 18. Most common mistakes
+## 22. Most common mistakes
 
-These are the problems people hit most often.
+### 1. Forgetting Catch-all and expecting random aliases to work
 
-### 1. Using a Cloudflare API key as `EMAIL_API_TOKEN`
+They usually will not.
 
-That is wrong.
+If you do not create every address explicitly and you also do not enable Catch-all, most random aliases will not behave the way you expect.
 
-`EMAIL_API_TOKEN` must be the Bearer token for your own Worker API.
+### 2. Reusing a production mail domain already backed by another MX-based provider
 
-### 2. Forgetting to enable Catch-all
+This is one of the most common sources of conflict.
 
-The project uses random mailbox names.  
-Without Catch-all, those addresses usually receive nothing.
+The safest fix is still:
 
-### 3. Putting the Worker URL into `EMAIL_DOMAIN`
+**use a dedicated subdomain**
 
-That is also wrong.
+### 3. Assuming Cloudflare provides a built-in inbox API
 
-- `EMAIL_DOMAIN` is the mail suffix
-- `EMAIL_API_URL` is the Worker URL
+It does not.
 
-### 4. Reusing a production mail domain that already has another mail service
+Email Routing handles inbound routing and processing.  
+If you want “query messages by alias address”, you usually need your own Worker + D1 + API layer.
 
-This often creates MX and routing conflicts.
+### 4. Exposing your mail API without auth
 
-The safest fix is:
+If you publish `/messages?address=...`, protect it.
 
-**use a dedicated subdomain.**
+The simplest option is:
 
-### 5. The API opens, but the project still finds no messages
+- `Authorization: Bearer ...`
 
-Check these first:
+You can also add:
 
-1. is the `Authorization` token correct
-2. does the queried `address` exactly match the recipient address
-3. is the Worker really writing to D1
-4. is Catch-all actually enabled
-5. is the route action really `Send to Worker`
+- Cloudflare Access
+- IP allowlists
+- private-network-only access
 
-### 6. Cloudflare Email Routing looks unstable
+### 5. Treating Subaddressing as a replacement for Catch-all
 
-Check for:
+They are not the same.
 
-- conflicting MX records
-- multiple SPF records
-- manually edited DNS records that Cloudflare created for Email Routing
+- `user+tag@example.com` is great for tagging an existing base address
+- Catch-all is what you want for truly arbitrary alias local-parts
 
 ---
 
-## 19. The simplest recommended deployment plan
+## 23. Real limits and boundaries
 
-If you want the most practical setup with the fewest surprises, do this:
+To avoid overselling the word “unlimited”, here is the practical truth.
 
-1. create a dedicated subdomain, such as `tvmail.example.com`
-2. enable Cloudflare Email Routing
-3. enable Catch-all
-4. set Catch-all to `Send to Worker`
-5. let the Worker parse mail and store it in D1
-6. expose `GET /messages?address=...`
-7. fill the project `.env` with:
+### 1. Cloudflare still has official service limits
+
+For example:
+
+- `200` routing rules by default
+- `200` addresses by default
+- a `25 MiB` message size cap
+- Worker limits
+
+So “unlimited” does not mean the platform has zero resource boundaries.
+
+### 2. The real “infinite” part is the alias-management model
+
+The real power of this approach is not:
+
+“Cloudflare has no limits”
+
+The real power is:
+
+### you no longer need to manually maintain huge numbers of real mailbox accounts
+
+With just:
+
+- one domain or subdomain
+- one Catch-all route
+- one Worker logic path
+
+you can handle very large numbers of random alias addresses cleanly.
+
+---
+
+## 24. If you want the shortest path, do this
+
+Use this minimum working stack:
+
+1. one dedicated subdomain such as `signup.example.com`
+2. Email Routing enabled
+3. Catch-all enabled
+4. Catch-all set to `Send to Worker`
+5. Worker stores mail in D1
+6. Worker exposes `GET /messages?address=...`
+
+That stack is already enough for:
+
+- signup bots
+- OTP automation
+- testing environments
+- disposable mail pipelines
+- internal notification intake
+
+---
+
+## 25. As one example: how this repo can use the same pattern
+
+Even though this guide is generic, here is a concrete repository example.
+
+If you want to connect this generic setup to the current repo, the project mainly reads:
 
 ```env
 EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=your-worker-url
-EMAIL_API_TOKEN=your-worker-bearer-token
-EMAIL_DOMAIN=your-mail-domain
+EMAIL_API_URL=https://mail-gateway-api.xxx.workers.dev
+EMAIL_API_TOKEN=your-worker-token
+EMAIL_DOMAIN=signup.example.com
 ```
 
-This matches the current project implementation cleanly and avoids extra rewrites.
-
----
-
-## 20. The easiest mental model
-
-If you want the plain-English explanation, think of it like this:
-
-### Cloudflare is the front desk, the Worker is the clerk, D1 is the storage room, and the project is the person picking up the letter.
-
-Each part does one job:
-
-- Cloudflare receives all mail sent to your domain
-- the Worker opens the message and records it
-- D1 stores the message data
-- the project asks for the latest message by mailbox address
-
-Once that model is clear, the whole setup becomes much easier to reason about.
-
----
-
-## 21. Quick configuration examples
-
-### Single domain
+If you want multiple domains:
 
 ```env
 EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=your-super-long-random-token
-EMAIL_DOMAIN=tvmail.example.com
+EMAIL_API_URL=https://mail-gateway-api.xxx.workers.dev
+EMAIL_API_TOKEN=your-worker-token
+EMAIL_DOMAINS=signup.example.com,verify.example.com
 ```
 
-### Multiple domains
+Inside this repo, those values drive:
 
-```env
-EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=your-super-long-random-token
-EMAIL_DOMAINS=tvmail.example.com,keys.example.com
-```
+- random mailbox generation
+- calls to your `/messages` API
+- extraction of verification codes and links
+
+But that is only one application of this pattern, not the point of the guide itself.
 
 ---
 
-## 22. Official references
+## 26. Official references
 
-If you want to compare this guide against the official docs, these are the most relevant Cloudflare pages:
+These were the main Cloudflare official docs cross-checked during this rewrite:
 
+- [Overview](https://developers.cloudflare.com/email-routing/)
 - [Enable Email Routing](https://developers.cloudflare.com/email-routing/get-started/enable-email-routing/)
-- [Email Routing Addresses and Rules](https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/)
-- [Email Routing Subdomains](https://developers.cloudflare.com/email-routing/setup/subdomains/)
-- [Email Routing DNS Records](https://developers.cloudflare.com/email-routing/setup/email-routing-dns-records/)
+- [Configure Rules and Addresses](https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/)
+- [Subdomains](https://developers.cloudflare.com/email-routing/setup/subdomains/)
 - [Enable Email Workers](https://developers.cloudflare.com/email-routing/email-workers/enable-email-workers/)
-- [Email Workers Runtime API](https://developers.cloudflare.com/email-routing/email-workers/runtime-api/)
-- [Troubleshooting SPF records](https://developers.cloudflare.com/email-routing/troubleshooting/email-routing-spf-records/)
+- [Email Workers](https://developers.cloudflare.com/email-routing/email-workers/)
+- [Runtime API](https://developers.cloudflare.com/email-routing/email-workers/runtime-api/)
+- [Limits](https://developers.cloudflare.com/email-routing/limits/)
 - [Test Email Routing](https://developers.cloudflare.com/email-routing/get-started/test-email-routing/)
 
 ---
 
-## 23. Final advice
+## 27. One final practical sentence
 
-If your goal is simply to get the project working, do not overbuild on day one.
+If you want a reusable, automation-friendly “unlimited alias domain mail” system, the most practical answer is not:
 
-Start with the minimum working stack:
+“create lots of mailbox accounts by hand”
 
-1. one subdomain
-2. one Catch-all route
-3. one Worker
-4. one D1 database
-5. one `/messages` endpoint
+It is:
 
-Get that pipeline working first.
+### Cloudflare Email Routing + Catch-all + Email Worker + your own mail-reading interface
 
-Then, if you want, you can improve it later with:
-
-- multiple rotating domains
-- message cleanup jobs
-- retention policies
-- dashboards
-- monitoring
-
-That order is usually the fastest and least frustrating path.
+Once that foundation is in place, you can reuse it for signups, automation, testing, internal tools, and project integrations like this repository.

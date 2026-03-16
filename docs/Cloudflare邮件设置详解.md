@@ -2,135 +2,248 @@
 
 [English Version](./Cloudflare-Mail-Setup-Guide.md)
 
-这篇文档只讲一件事：
+通用版教程：用 Cloudflare Email Routing、Catch-all 和 Email Workers，搭一套可以长期复用的“无限别名域名邮箱”方案。
 
-把 `Cloudflare 域名邮箱 + 一个简单的收信 API` 配好，让我们的 `tavily-key-generator` 可以直接使用。
+> 本文里的“无限域名邮箱”，准确说是“无限别名域名邮箱”。
+> 也就是：你不需要预先创建每一个邮箱账号，就能接住发往你域名下任意随机地址的邮件。
+> 这对注册网站、自动化收验证码、测试环境、内部通知系统都很好用。
 
-如果你只想先记住一句话，可以先记这个：
-
-> Cloudflare 负责收邮件，我们自己的 API 负责把邮件内容提供给项目读取。
+本文已按 Cloudflare 官方文档于 `2026-03-16` 核对。
 
 ---
 
-## 一、先搞清楚项目到底需要什么
+## 一、这篇文档适合谁
 
-很多人第一次看到 `Cloudflare`、`邮箱`、`API` 这几个词放在一起，会误以为：
+这篇教程不是只给 `tavily-key-generator` 用的。
 
-- 项目直接调用 Cloudflare 官方邮箱接口
-- Cloudflare 后台里点几下就能直接给项目读邮件
+只要你有下面这些需求，它都适用：
 
-这两个理解都不对。
+- 想把自己的域名变成“可无限生成别名”的收信入口
+- 想收验证码、登录链接、确认邮件，而不想手动建一堆邮箱账号
+- 想把域名邮箱接进脚本、自动化系统、注册机、测试环境
+- 想把邮件转发给 Gmail / Outlook / 企业邮箱
+- 想自己做一个邮件 API，让程序通过 HTTP 查询邮件内容
 
-我们项目当前的实际逻辑是：
+如果你只是想做最简单的域名邮箱转发，这篇能用。  
+如果你想做自动化邮件系统，这篇也能直接沿着往下搭。
 
-1. 自动生成一个随机邮箱地址，比如 `tavily-ab12cd34@tvmail.example.com`
-2. 用这个邮箱去注册 Tavily
-3. 等 Tavily 把验证码邮件发过来
-4. 项目去请求你提供的邮件 API：
+---
+
+## 二、先把“无限域名邮箱”这件事说清楚
+
+很多人第一次听到“无限域名邮箱”，会误以为是下面两种意思：
+
+1. 一个 Cloudflare 账号可以无限创建正式邮箱账户
+2. Cloudflare 原生提供完整的收件箱系统，像 Gmail 一样直接登录查看邮件
+
+这两个理解都不准确。
+
+更准确的说法是：
+
+### 你可以用自己的域名，接住几乎无限多的随机收件地址，而不需要一条条手工创建邮箱。
+
+比如下面这些地址：
 
 ```text
-GET {EMAIL_API_URL}/messages?address=随机邮箱地址
-Authorization: Bearer {EMAIL_API_TOKEN}
+anything-1@example.com
+signup-abc@example.com
+tavily-x8y9z0@example.com
+notify-order-123@example.com
 ```
 
-然后从返回结果里读取：
+你并不需要提前在后台创建这些具体邮箱。
 
-- `subject`
-- `text`
-- `html`
+你只需要：
 
-再提取 6 位验证码。
+1. 开启 Cloudflare Email Routing
+2. 配置 Catch-all
+3. 决定这些邮件最终交给谁处理
 
-换句话说，项目真正需要的是两部分能力：
+这样一来，发到你域名上的大量随机地址都能被统一接住。
 
-1. **能接住发到你域名上的邮件**
-2. **能通过一个 HTTP API 把邮件内容查出来**
+### 但它不是没有任何限制
 
-Cloudflare 只能很好地解决第 1 部分。  
-第 2 部分需要我们自己补一层很薄的 API。
+根据 Cloudflare 官方文档，截至 `2026-03-16`，你仍然需要注意这些限制：
+
+- Email Routing 的 `Rules` 默认上限是 `200`
+- `Addresses` 默认上限是 `200`
+- 单封邮件大小目前不支持超过 `25 MiB`
+- 如果你用 Email Workers，仍然受 Workers 资源限制影响
+
+如果默认上限不够，Cloudflare 官方文档还提供了申请提高限制的入口。
+
+所以，“无限”更适合理解成：
+
+### 对实际使用来说，你可以不预创建邮箱账号，靠 Catch-all 和 Worker 处理无限多的随机别名地址。
+
+这才是这套方案真正的价值。
 
 ---
 
-## 二、整体架构长什么样
+## 三、它能做什么，不能做什么
 
-建议你把整个链路理解成下面这样：
+先把边界说清楚，后面配置时就不容易绕。
 
-```text
-Tavily 发送验证码邮件
-        ↓
-tavily-随机串@你的域名
-        ↓
-Cloudflare Email Routing 收到邮件
-        ↓
-Catch-all 规则命中
-        ↓
-邮件交给 Email Worker
-        ↓
-Worker 解析邮件并写入 D1
-        ↓
-我们的项目请求 /messages?address=...
-        ↓
-拿到邮件内容并提取验证码
-```
+### 它很适合做这些事
 
-这个结构看起来步骤多，但每一层都很清楚：
+- 网站注册验证码收信
+- 自动化注册系统
+- 测试环境邮箱
+- 服务通知归集
+- 多平台订阅和注册分流
+- 内部工具邮件入口
+- 给不同用途分配不同别名地址
 
-- `Email Routing` 负责收
-- `Worker` 负责处理
-- `D1` 负责存
-- `API` 负责查
+### 它不适合直接替代完整企业邮箱
 
----
+如果你想要的是这些能力：
 
-## 三、为什么推荐用子域名，而不是直接拿主域名上
+- 标准网页邮箱界面
+- 发件箱 / 已发送 / 草稿箱
+- IMAP / POP3 的完整邮箱客户端体验
+- 一套“一个人一个正式邮箱账号”的办公邮箱系统
 
-如果你的主域名已经在跑正式邮箱，比如：
+那你要找的是：
 
 - Google Workspace
+- Microsoft 365
 - Zoho Mail
-- 腾讯企业邮
-- 阿里云企业邮箱
+- Fastmail
+- 其他专门的邮箱托管服务
 
-那最稳的做法是：
+Cloudflare Email Routing 更像是：
 
-**不要直接拿主域名硬改，单独准备一个子域名。**
+**一套极强的“收信入口 + 分发/处理层”**
+
+而不是一套完整的传统邮箱产品。
+
+另外，Cloudflare 官方文档也明确写了：
+
+### Email Routing 不处理出站发信，也不提供 SMTP server。
+
+所以如果你需要“发邮件”能力，需要额外接别的发信方案。
+
+---
+
+## 四、整体架构怎么选
+
+这套方案通常有两种常见用法。
+
+### 模式 A：普通转发模式
+
+适合个人和轻量使用。
+
+```text
+发往你的域名邮箱
+        ↓
+Cloudflare Email Routing
+        ↓
+转发到你的 Gmail / Outlook / 企业邮箱
+```
+
+优点：
+
+- 配起来最快
+- 不需要写代码
+- 适合普通订阅、备用邮箱、注册收信
+
+缺点：
+
+- 自动化能力有限
+- 不方便程序直接读取
+- 后续做分类、API 查询、验证码提取时不够灵活
+
+### 模式 B：Worker 自动化模式
+
+适合开发者、脚本、项目接入。
+
+```text
+发往你的域名邮箱
+        ↓
+Cloudflare Email Routing
+        ↓
+Catch-all 命中
+        ↓
+Email Worker 处理
+        ↓
+D1 / KV / R2 / Webhook / 你的 API
+        ↓
+程序、项目或内部系统读取
+```
+
+优点：
+
+- 非常适合自动化
+- 可以直接做邮件 API
+- 可以解析验证码、链接、主题、正文
+- 可以接通知系统、数据库、后台面板
+- 可以把“无限别名地址”真正变成程序可用能力
+
+缺点：
+
+- 需要写一点 Worker 代码
+- 需要理解 D1 / API / 路由这些概念
+
+如果你只是想正常收信，用模式 A。  
+如果你是为了自动化、脚本或项目接入，直接上模式 B。
+
+---
+
+## 五、主域名还是子域名，怎么选
+
+这一步很重要，关系到后面会不会踩坑。
+
+### 最推荐：单独用一个子域名
 
 例如：
 
-- `tvmail.example.com`
-- `keys.example.com`
-- `verify.example.com`
+- `mail.example.com`
+- `notify.example.com`
+- `signup.example.com`
+- `box.example.com`
 
-为什么这么做：
+为什么推荐子域名：
 
-1. 不会影响你现有正式邮箱
-2. 配置更干净，排障更简单
-3. 更适合这种“专门给脚本自动收验证码”的用途
+1. 不会影响你主域名现有业务
+2. DNS 更干净
+3. 更适合“自动化收信”这种场景
+4. 排障更简单
 
-你完全可以理解成：
+### 如果你的主域名已经在跑正式邮箱，别硬改
 
-- 主域名继续跑正常业务邮箱
-- 子域名专门给 `tavily-key-generator` 收验证码
+Cloudflare 官方文档说明得很明确：
+
+当 Email Routing 正在工作时，你不能在同一个被配置的域名上同时保留其他活跃的 MX 邮件服务。
+
+换句话说，如果你的主域名已经在用：
+
+- Google Workspace
+- 腾讯企业邮
+- 阿里云企业邮箱
+- Microsoft 365
+
+那最稳的方式永远是：
+
+**新开一个专用子域名来做这件事。**
 
 ---
 
-## 四、开始前你需要准备什么
+## 六、开始前需要准备什么
 
-正式开配前，建议先确认这几项：
+正式动手前，先准备好这些：
 
-1. 你已经有一个接入 Cloudflare 的域名
-2. 你能正常登录 Cloudflare Dashboard
-3. 你已经决定好要用哪个域名或子域名来收验证码邮件
-4. 你愿意顺手部署一个很小的 Cloudflare Worker
-5. 你本地能使用 `node`、`npm`、`wrangler`
+1. 一个已经接入 Cloudflare 的域名
+2. Cloudflare Dashboard 访问权限
+3. 一个决定好的主域名或子域名
+4. 如果要做自动化模式，本地能使用 `node`、`npm`、`wrangler`
 
-如果还没有 `wrangler`，先安装：
+如果你还没装 `wrangler`：
 
 ```bash
 npm install -g wrangler
 ```
 
-然后登录：
+登录：
 
 ```bash
 wrangler login
@@ -138,215 +251,379 @@ wrangler login
 
 ---
 
-## 五、第一步：把域名或子域名接入 Cloudflare
+## 七、第一步：开启 Email Routing
 
-如果你的域名还没接入 Cloudflare：
-
-1. 登录 Cloudflare
-2. 点 `Add a site`
-3. 输入你的域名
-4. 按提示修改 nameserver
-5. 等待状态变成 `Active`
-
-如果域名早就在 Cloudflare 里，你只需要继续下一步。
-
-如果你打算用子域名，建议先想好一个专门的名字，比如：
-
-```text
-tvmail.example.com
-```
-
-后面项目里 `EMAIL_DOMAIN` 就要填这个值。
-
----
-
-## 六、第二步：开启 Email Routing
-
-进入 Cloudflare 控制台：
+进入：
 
 ```text
 Cloudflare Dashboard
--> 选择你的域名
+-> 你的域名
 -> Email
 -> Email Routing
 ```
 
-第一次进入时，Cloudflare 一般会提示你开启 Email Routing。
+第一次使用时，Cloudflare 会提示你开启 Email Routing。
 
-你照着引导做就行，核心动作就两个：
+你照向导做即可，核心动作是：
 
-1. 启用 Email Routing
+1. 开启 Email Routing
 2. 允许 Cloudflare 自动添加需要的 DNS 记录
 
-这些记录通常包括：
+这一步通常会涉及：
 
 - `MX`
 - `TXT`
 
-你在这里需要特别注意下面几件事。
+### 这里有 3 个高频坑
 
-### 1. 不要和现有 MX 记录冲突
+#### 1. 旧 MX 记录冲突
 
-如果这个域名本来就有别的邮件服务在使用 `MX` 记录，Cloudflare 可能会提示冲突。
+如果这个域名本来就在跑其他邮件服务，Cloudflare 会提示冲突。
+
+如果你不删除旧 MX，Email Routing 通常无法正常启用。
+
+#### 2. SPF 记录冲突
+
+如果后台报 SPF 问题，尽快修。
+
+多个 SPF 记录经常会让邮件链路表现异常。
+
+#### 3. 不要乱改 Cloudflare 自动生成的邮件 DNS
+
+Cloudflare 为 Email Routing 自动生成的记录，能不手改就别手改。
+
+---
+
+## 八、第二步：如果要用子域名，先把子域名加进去
+
+如果你用的是：
+
+```text
+signup.example.com
+```
+
+这种子域名，而不是 zone 顶级域名，那么要先在 Cloudflare 里启用这个子域名的 Email Routing 能力。
+
+操作路径：
+
+```text
+Email
+-> Email Routing
+-> Settings
+-> Add subdomain
+```
+
+加好之后，Cloudflare 会在 Routing Rules 里允许你选择：
+
+- 顶级域名
+- 已配置的子域名
+
+这一步做完后，你就可以对这个子域名创建自定义地址和路由规则了。
+
+---
+
+## 九、第三步：理解 3 个核心概念
+
+Cloudflare Email Routing 里最常用的其实就这 3 个概念。
+
+### 1. Custom address
+
+这是你显式创建的一条邮箱规则，比如：
+
+```text
+info@example.com
+news@example.com
+verify@example.com
+```
+
+适合你明确知道自己要哪些固定地址时使用。
+
+### 2. Catch-all
+
+这是最关键的能力。
+
+它的作用是：
+
+**让没有显式创建规则的地址，也能被统一接住。**
+
+对“无限别名邮箱”方案来说，Catch-all 基本上是必需的。
+
+有了它，你就不需要逐个创建：
+
+```text
+a1@example.com
+a2@example.com
+a3@example.com
+random-1@example.com
+random-2@example.com
+```
+
+这些地址都可以统一走 Catch-all。
+
+### 3. Subaddressing（Plus Addressing）
+
+Cloudflare 现在支持类似：
+
+```text
+user+tag@example.com
+```
+
+这样的地址形式。
+
+这更适合“在一个固定地址上附加标签”。
+
+例如：
+
+```text
+newsletter+reddit@example.com
+newsletter+github@example.com
+```
+
+它适合做来源标记，但它不是 Catch-all 的替代品。
 
 简单说：
 
-- 如果这个域名已经给正式邮箱用了，就别直接拿它做这套
-- 最稳的是换一个子域名专门用
-
-### 2. SPF 冲突要及时修
-
-Cloudflare 后台如果提示 SPF 问题，别忽略。
-
-一个域名通常只应该有一个有效 SPF 入口。  
-如果你有多条 SPF，很容易导致 Email Routing 状态异常或者验证失败。
-
-### 3. DNS 记录建议保持 Cloudflare 自动生成的状态
-
-Email Routing 正常工作后，尽量不要手动乱改它自动生成的邮件 DNS 记录。
+- 想接住任意随机 local-part，用 Catch-all
+- 想在一个已有地址上附加上下文标签，用 Subaddressing
 
 ---
 
-## 七、第三步：一定要开启 Catch-all
+## 十、第四步：先决定邮件最终去哪
 
-这一步是整个配置里最关键的一步。
+你在 Cloudflare 里配置路由时，最终一般有两条路。
 
-为什么说关键？
+### 方案 A：转发给一个真实邮箱
 
-因为我们的项目不是使用固定邮箱地址，而是每次自动生成随机地址。
+比如：
 
-比如这类地址：
+- Gmail
+- Outlook
+- 企业邮箱
+
+这是最简单的路线。
+
+操作逻辑是：
 
 ```text
-tavily-a1b2c3d4@tvmail.example.com
-tavily-z9y8x7w6@tvmail.example.com
+自定义地址 / Catch-all
+-> 转发到 verified destination address
 ```
 
-也就是说，你不可能在 Cloudflare 后台一个个手动创建这些地址。
+适合：
 
-正确做法是：
+- 普通收信
+- 个人备用邮箱
+- 注册网站
+- 邮件归集
 
-**开启 Catch-all，让所有随机地址都能被统一接住。**
+### 方案 B：交给 Email Worker
 
-操作方法：
+这是更适合自动化和项目接入的路线。
 
-1. 进入 `Email Routing`
-2. 找到 `Routes`
-3. 找到 `Catch-all address`
-4. 开启它
-5. 把动作设置成交给 `Worker`
+操作逻辑是：
 
-这一步配置完成后，所有发到这个域名、但没有单独配置规则的邮箱地址，都会统一走 Catch-all。
+```text
+自定义地址 / Catch-all
+-> Send to Email Worker
+```
 
-这正好就是我们项目需要的效果。
+适合：
+
+- 自动提取验证码
+- 自动取确认链接
+- 做邮件 API
+- 接数据库
+- 推送到 Telegram / Discord / Webhook
+- 给程序读取
+
+如果你的目标是“让脚本和项目直接读邮件”，就别转发到普通邮箱，直接交给 Worker。
 
 ---
 
-## 八、第四步：不要把邮件转发到普通邮箱，直接交给 Worker
+## 十一、第五步：开启 Catch-all
 
-Cloudflare Email Routing 有几种处理方式，比如：
+现在进入：
 
-- 转发到另一个真实邮箱
-- 交给 Worker 处理
+```text
+Email
+-> Email Routing
+-> Routes
+```
 
-对我们的项目来说，最佳选择是：
+找到 `Catch-all address`。
 
-**直接交给 Worker。**
+然后：
 
-原因很简单：
+1. 打开它，让状态变成 `Active`
+2. 选择处理动作
+3. 保存
 
-如果你转发到 Gmail、Outlook 或者其他邮箱，再让项目去登录那个邮箱查信，会变得很绕：
+处理动作可以是：
 
-- 还要搞 IMAP / POP3 / 网页抓取
-- 延迟更高
-- 风控更多
-- 结构也不稳定
+- Forward to destination address
+- Send to Worker
 
-而直接交给 Worker 的好处是：
+### 推荐做法
 
-- 邮件一到就能被代码接住
-- 可以按我们项目需要的格式保存
-- 后续只用请求 `/messages` 就行
+如果你只想把各种随机地址收进 Gmail：
 
-所以这套链路最推荐的做法是：
+```text
+Catch-all -> Forward to Gmail
+```
+
+如果你想做自动化邮箱系统：
 
 ```text
 Catch-all -> Send to Worker
 ```
 
+这一步就是“无限别名邮箱”能否跑起来的关键。
+
 ---
 
-## 九、第五步：创建一个专门的邮件 Worker 项目
+## 十二、第六步：普通转发模式怎么配
+
+如果你只是想让自己的域名邮箱转发到一个真实邮箱，这里就是最短路径。
+
+### 配置流程
+
+1. 启用 Email Routing
+2. 添加一个 Destination address
+3. 完成 destination 验证
+4. 新建一条 Custom address 或 Catch-all
+5. Action 选 `Forward`
+6. Destination 选你刚验证过的邮箱
+
+### 例子
+
+你可以这样配：
+
+```text
+newsletter@example.com -> yourname@gmail.com
+billing@example.com -> yourname@gmail.com
+Catch-all@example.com -> yourname@gmail.com
+```
+
+这样以后发到：
+
+```text
+anything@example.com
+signup-test@example.com
+random-2026@example.com
+```
+
+的邮件都能进你的 Gmail。
+
+### 这条路线适合谁
+
+适合：
+
+- 普通收信
+- 网站注册
+- 订阅管理
+- 个人邮箱分流
+
+不太适合：
+
+- 自动提取验证码
+- 程序直接读邮件
+- 搭内部邮箱 API
+
+---
+
+## 十三、第七步：自动化模式怎么配
+
+如果你要的是“让程序直接读邮件”，就走这条。
+
+推荐结构：
+
+```text
+Cloudflare Email Routing
+        ↓
+Catch-all
+        ↓
+Email Worker
+        ↓
+D1 / KV / R2 / Webhook / API
+        ↓
+你的程序或项目
+```
+
+最常见、最好用的落地方式是：
+
+- `Email Worker` 负责接邮件
+- `D1` 负责存邮件内容
+- `fetch()` 负责暴露一个 HTTP API
+
+这是最通用的模式。
+
+---
+
+## 十四、第八步：创建一个通用邮件 Worker
 
 本地执行：
 
 ```bash
-npm create cloudflare@latest tavily-mail-api
-cd tavily-mail-api
+npm create cloudflare@latest mail-gateway-api
+cd mail-gateway-api
 npm i postal-mime
 ```
 
-这里安装 `postal-mime` 的原因很简单：
+这里用 `postal-mime` 的原因很简单：
 
-Cloudflare 交给 Worker 的是原始邮件内容，我们需要把它解析成更容易读取的结构，比如：
+Cloudflare 给 Worker 的是原始邮件。  
+我们通常需要把它解析成：
 
-- 主题
-- 文本正文
-- HTML 正文
+- `subject`
+- `text`
+- `html`
+- `from`
+- `to`
 
-这样我们的项目就能直接从 API 返回里拿 `subject / text / html`。
+这样后面的 API、数据库和自动化逻辑都更容易做。
 
 ---
 
-## 十、第六步：创建 D1 数据库
+## 十五、第九步：创建 D1 数据库
 
-接下来创建数据库：
+先建库：
 
 ```bash
-npx wrangler d1 create tavily_mail
+npx wrangler d1 create mail_gateway
 ```
 
-创建完成后，Cloudflare 会返回一个 `database_id`。  
-记下来，后面 `wrangler.toml` 要用。
+记住返回的 `database_id`。
 
-然后新建一个 `schema.sql`：
+然后新建 `schema.sql`：
 
 ```sql
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
-  address TEXT NOT NULL,
+  message_to TEXT NOT NULL,
+  message_from TEXT,
   subject TEXT,
   text TEXT,
   html TEXT,
   received_at INTEGER NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_address_time
-ON messages(address, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_to_time
+ON messages(message_to, received_at DESC);
 ```
 
-执行初始化：
+执行：
 
 ```bash
-npx wrangler d1 execute tavily_mail --file=schema.sql
+npx wrangler d1 execute mail_gateway --file=schema.sql
 ```
 
-这张表足够应付我们项目当前的用法。
-
-字段解释：
-
-- `id`：邮件唯一标识
-- `address`：收件地址，也就是项目生成出来的那个随机邮箱
-- `subject`：邮件主题
-- `text`：纯文本正文
-- `html`：HTML 正文
-- `received_at`：收信时间，用于排序
+这套表结构已经足够应付绝大多数“自动收验证码 / 自动收通知”的场景。
 
 ---
 
-## 十一、第七步：写 Worker 代码
+## 十六、第十步：最小可用 Worker 示例
 
-在 `src/index.ts` 里放下面这份最小可用版本：
+在 `src/index.ts` 里放一个最小版本：
 
 ```ts
 import PostalMime from "postal-mime";
@@ -374,12 +651,13 @@ export default {
 
     await env.DB.prepare(
       `INSERT OR REPLACE INTO messages
-       (id, address, subject, text, html, received_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6)`
+       (id, message_to, message_from, subject, text, html, received_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)`
     )
       .bind(
         id,
         String(message.to).toLowerCase(),
+        parsed.from?.address || "",
         parsed.subject || "",
         parsed.text || "",
         typeof parsed.html === "string" ? parsed.html : "",
@@ -397,18 +675,14 @@ export default {
 
     if (req.method === "GET" && url.pathname === "/messages") {
       const address = (url.searchParams.get("address") || "").trim().toLowerCase();
-
       if (!address) {
-        return Response.json(
-          { error: "missing address" },
-          { status: 400 }
-        );
+        return Response.json({ error: "missing address" }, { status: 400 });
       }
 
       const result = await env.DB.prepare(
-        `SELECT id, subject, text, html, received_at
+        `SELECT id, message_to, message_from, subject, text, html, received_at
          FROM messages
-         WHERE address = ?1
+         WHERE message_to = ?1
          ORDER BY received_at DESC
          LIMIT 20`
       )
@@ -416,13 +690,7 @@ export default {
         .all();
 
       return Response.json({
-        messages: (result.results || []).map((row: any) => ({
-          id: row.id,
-          subject: row.subject || "",
-          text: row.text || "",
-          html: row.html || "",
-          received_at: row.received_at,
-        })),
+        messages: result.results || [],
       });
     }
 
@@ -431,70 +699,55 @@ export default {
 };
 ```
 
-你不需要一开始就把它想得多复杂。
-
-这段代码就做两件事：
+这段代码做了 2 件事：
 
 ### `email()`
 
-当 Cloudflare 收到邮件后，会自动调用这里。  
-我们在这里把邮件解析出来，然后写入 D1。
+Cloudflare 收到邮件后，会把邮件交给这里。  
+这里负责解析邮件并写进 D1。
 
 ### `fetch()`
 
-当我们的项目去请求：
+你的脚本、项目、后台、自动化程序，都可以通过：
 
 ```text
-/messages?address=某个随机邮箱
+GET /messages?address=xxx@example.com
 ```
 
-就从 D1 里把这个邮箱最近收到的邮件取出来。
+来读取某个邮箱地址最近收到的邮件。
 
 ---
 
-## 十二、第八步：配置 `wrangler.toml`
+## 十七、第十一步：配置 `wrangler.toml`
 
-写一个最小版本：
+一个最小可用配置长这样：
 
 ```toml
-name = "tavily-mail-api"
+name = "mail-gateway-api"
 main = "src/index.ts"
 compatibility_date = "2026-03-16"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "tavily_mail"
-database_id = "替换成你的 D1 database_id"
+database_name = "mail_gateway"
+database_id = "replace-with-your-database-id"
 ```
 
-然后设置一个自己的 API Token：
+再设置一个访问 API 用的 Bearer Token：
 
 ```bash
 npx wrangler secret put API_TOKEN
 ```
 
-这里输入一个你自己定义的长字符串，比如：
+输入一串足够长的随机字符串。
 
-```text
-your-super-long-random-token
-```
+这个 token 的用途是：
 
-这一步要记住一个很重要的点：
-
-**这个 `API_TOKEN` 才是后面要填到项目 `EMAIL_API_TOKEN` 里的值。**
-
-不是下面这些：
-
-- 不是 Cloudflare Global API Key
-- 不是 Cloudflare API Token
-- 不是 Zone Token
-- 不是账户级密钥
-
-就是你这个 Worker API 自己的 Bearer Token。
+**保护你的邮件读取 API，不让别人随便查。**
 
 ---
 
-## 十三、第九步：部署 Worker
+## 十八、第十二步：部署 Worker
 
 执行：
 
@@ -502,21 +755,24 @@ your-super-long-random-token
 npx wrangler deploy
 ```
 
-部署成功后，你会得到一个地址，通常类似：
+部署完成后，你通常会得到一个地址，像这样：
 
 ```text
-https://tavily-mail-api.xxx.workers.dev
+https://mail-gateway-api.xxx.workers.dev
 ```
 
-这个地址就是你后面要填到项目里的：
+这个地址以后可以给：
 
-```env
-EMAIL_API_URL=...
-```
+- 自动化脚本
+- 项目配置
+- 内部系统
+- 管理后台
+
+用来读取邮件内容。
 
 ---
 
-## 十四、第十步：把 Catch-all 路由到这个 Worker
+## 十九、第十三步：把 Cloudflare 路由到 Worker
 
 现在回到 Cloudflare Dashboard：
 
@@ -526,307 +782,290 @@ Email
 -> Routes
 ```
 
-找到 `Catch-all address`，把动作设置为：
+找到：
+
+- 某个 Custom address
+- 或者 Catch-all
+
+把 `Action` 设成：
 
 ```text
 Send to a Worker
 ```
 
-然后选中你刚刚部署好的 Worker。
+然后选中你刚部署好的 Worker。
 
-到这里，Cloudflare 这边的“收信链路”就齐了。
-
-链路会变成：
+到这里，这套链路就齐了：
 
 ```text
-发到任意随机邮箱
+任意别名地址来信
 -> Cloudflare Catch-all 命中
--> 交给 Worker
--> Worker 写入 D1
--> 我们的项目去查 API
+-> Email Worker 接收
+-> D1 保存
+-> API 提供查询
 ```
 
 ---
 
-## 十五、第十一步：在项目里填写 `.env`
+## 二十、最常见的 4 种实际玩法
 
-如果你只准备用一个域名：
+### 玩法 1：网站注册专用域名邮箱
 
-```env
-EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=你刚刚设置的API_TOKEN
-EMAIL_DOMAIN=tvmail.example.com
-```
-
-如果你想准备多个域名，让项目启动时自由选择：
-
-```env
-EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=你刚刚设置的API_TOKEN
-EMAIL_DOMAINS=tvmail.example.com,keys.example.com
-```
-
-你可以这样理解这些变量：
-
-### `EMAIL_PROVIDER`
-
-固定填：
+比如你准备：
 
 ```text
-cloudflare
+signup.example.com
 ```
 
-表示当前走的是 Cloudflare 域名邮箱方案。
-
-### `EMAIL_API_URL`
-
-填你自己这个 Worker API 的地址。
-
-注意：
-
-**这里不是 Cloudflare 官方控制台 API 地址。**
-
-### `EMAIL_API_TOKEN`
-
-填你自己设置给 Worker 的 Bearer Token。
-
-注意：
-
-**这里不是 Cloudflare 平台 API Key。**
-
-### `EMAIL_DOMAIN`
-
-填邮箱后缀，比如：
+以后注册任何网站都用随机地址：
 
 ```text
-tvmail.example.com
+reddit-001@signup.example.com
+github-002@signup.example.com
+shop-003@signup.example.com
 ```
 
-项目会自动拼成：
+这样做的好处：
+
+- 不暴露主邮箱
+- 一看地址就知道来源
+- 哪个站泄露了邮箱很容易定位
+
+### 玩法 2：自动化验证码收信
+
+比如：
+
+- 自动化注册脚本
+- 测试环境注册流程
+- QA 邮件验证流程
+
+这类场景最适合：
 
 ```text
-tavily-随机串@tvmail.example.com
+Catch-all -> Worker -> API
 ```
 
-### `EMAIL_DOMAINS`
+程序直接读 API，不用登录邮箱网页。
 
-如果你填多个域名，项目启动时会让你选本轮用哪一个。
+### 玩法 3：内部通知入口
+
+你可以把不同系统通知发到不同别名：
+
+```text
+billing@notify.example.com
+alarm@notify.example.com
+backup@notify.example.com
+```
+
+再由 Worker 按主题、来源、目标系统分流。
+
+### 玩法 4：临时一次性邮箱体系
+
+你甚至可以在 Worker 里加上：
+
+- 自动过期
+- 定时清理
+- 只保留最近 N 天
+- 只允许指定发件人
+
+这样就能把它做成一套自己的“临时邮箱系统”。
 
 ---
 
-## 十六、项目是怎么拼邮箱地址的
+## 二十一、怎么验证你这套链路真的通了
 
-这一点很多人配置时会忽略，所以这里单独说清楚。
-
-项目当前的逻辑不是读取一个固定邮箱账号，而是自动生成随机地址。
-
-类似这样：
-
-```text
-tavily-abcdefgh@tvmail.example.com
-```
-
-所以：
-
-- 你不需要提前创建具体的 `tavily-abcdefgh`
-- 你也不需要一条条手工建邮箱账号
-- 你只需要保证 `Catch-all` 能接住所有随机地址
-
-这是为什么前面一直强调：
-
-**Catch-all 一定要开。**
-
----
-
-## 十七、第十二步：上线前先手工验证
-
-建议不要一上来就直接跑项目。
-
-先做 3 个小验证，成功率会高很多。
+推荐按下面顺序测试。
 
 ### 验证 1：人工发一封测试邮件
 
-随便找一个不存在但会命中 Catch-all 的地址，比如：
+随便找一个会命中 Catch-all 的地址，比如：
 
 ```text
-test-123@tvmail.example.com
+test-123@signup.example.com
 ```
 
-从另一个邮箱给它发一封邮件。
+从另一个邮箱给它发一封测试邮件。
 
-### 验证 2：直接用 curl 查 API
+注意：
+
+Cloudflare 官方建议你不要从目标 destination 自己发给自己。  
+有些邮箱提供商会把这种情况视为重复邮件，导致你误判链路有问题。
+
+### 验证 2：如果你走普通转发模式
+
+看 Gmail / Outlook / 企业邮箱里有没有收到。
+
+### 验证 3：如果你走 Worker 自动化模式
+
+用 curl 测试 API：
 
 ```bash
-curl -H "Authorization: Bearer 你的API_TOKEN" \
-  "https://tavily-mail-api.xxx.workers.dev/messages?address=test-123@tvmail.example.com"
+curl -H "Authorization: Bearer your-token" \
+  "https://mail-gateway-api.xxx.workers.dev/messages?address=test-123@signup.example.com"
 ```
 
-如果返回结构里能看到：
-
-- `messages`
-- `subject`
-- `text`
-- `html`
-
-说明收信链路已经通了。
-
-### 验证 3：再跑项目
-
-```bash
-python3 run.py
-```
-
-如果验证码阶段项目能自动继续，说明这套配置已经完全打通。
+如果能返回 `messages` 数组，说明链路已经打通。
 
 ---
 
-## 十八、最常见的错误
+## 二十二、最常见的坑
 
-下面这些坑非常常见，建议你配置时顺手对照一遍。
+### 1. 没开 Catch-all，却以为随机别名会自动生效
 
-### 1. 把 `EMAIL_API_TOKEN` 填成 Cloudflare 官方 API Key
+不会。
 
-这是错的。
+如果你没有显式创建每个地址，又没开 Catch-all，那大多数随机地址不会按你预期处理。
 
-这里要填的是你自己 Worker 的 Bearer Token。
+### 2. 主域名已经在跑别的邮箱，还强行上 Email Routing
 
-### 2. 没开 Catch-all
+这非常容易和现有 MX 冲突。
 
-你们项目用的是随机邮箱名。  
-如果不打开 Catch-all，随机地址收不到邮件。
+最稳做法还是：
 
-### 3. 把 `EMAIL_DOMAIN` 填成 Worker 地址
+**换一个专用子域名。**
 
-这是错的。
+### 3. 以为 Cloudflare 自带完整 inbox API
 
-- `EMAIL_DOMAIN` 是邮箱后缀
-- `EMAIL_API_URL` 才是 Worker 地址
+没有。
 
-### 4. 主域名上已经在跑正式邮箱，还直接开启 Email Routing
+Cloudflare Email Routing 负责收信和处理流转；  
+如果你要“按地址查邮件内容”，通常需要你自己做 Worker + D1 + API 这一层。
 
-这很容易和现有邮件服务冲突。
+### 4. 忘了保护自己的邮件查询 API
 
-最稳做法永远是：
+如果你暴露了 `/messages?address=...` 这种接口，一定要加认证。
 
-**用一个单独子域名。**
+最简单的就是：
 
-### 5. API 能打开，但项目拿不到邮件
+- `Authorization: Bearer ...`
 
-通常排查这几项：
+更进一步还可以加：
 
-1. `Authorization` token 对不对
-2. 查询的 `address` 和实际收件地址是否一致
-3. Worker 是否真的把邮件写进了 D1
-4. Catch-all 是否真的已经启用
-5. 路由动作是否真的是 `Send to Worker`
+- Cloudflare Access
+- IP 白名单
+- 内部网络限制
 
-### 6. 邮件确实发了，但 Cloudflare 后台一直不稳定
+### 5. 把 Subaddressing 当成 Catch-all
 
-优先检查：
+这两个不是一回事。
 
-- 是否有旧 MX 冲突
-- 是否有多个 SPF 记录
-- 是否误改了 Email Routing 自动生成的 DNS 记录
+- `user+tag@example.com` 适合固定地址加标签
+- Catch-all 适合接住完全随机的地址
 
 ---
 
-## 十九、最推荐的落地方式
+## 二十三、这套方案的限制和现实边界
 
-如果你不想走弯路，最推荐直接照这个方案来：
+为了避免把“无限别名”误解成“完全无限”，这里把边界说清楚。
 
-1. 准备一个专用子域名，比如 `tvmail.example.com`
-2. 在 Cloudflare 开启 Email Routing
+### 1. Cloudflare 仍然有官方限制
+
+例如：
+
+- Routing rules 默认 `200`
+- Addresses 默认 `200`
+- 邮件大小上限 `25 MiB`
+- Worker 资源限制
+
+所以不要把“无限”理解成平台侧完全没有任何资源边界。
+
+### 2. 真正“无限”的是别名管理成本
+
+这套方案真正厉害的地方不是：
+
+“平台什么都无限”
+
+而是：
+
+### 你不再需要人工维护成百上千个真实邮箱账号。
+
+你只要：
+
+- 一个域名或子域名
+- 一条 Catch-all
+- 一套 Worker 处理逻辑
+
+就能把大量随机地址收进来。
+
+---
+
+## 二十四、如果你只是想最快跑通，最推荐这样做
+
+直接用这套最小组合：
+
+1. 一个子域名，例如 `signup.example.com`
+2. 开启 Email Routing
 3. 开启 Catch-all
-4. Catch-all 动作设为 `Send to Worker`
-5. Worker 解析邮件并写入 D1
+4. Catch-all 指向 Email Worker
+5. Worker 把邮件写到 D1
 6. Worker 暴露 `GET /messages?address=...`
-7. 在项目 `.env` 里填：
 
-```env
-EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=你的Worker地址
-EMAIL_API_TOKEN=你的Worker Bearer Token
-EMAIL_DOMAIN=你的收信域名
-```
+这已经足够支持：
 
-这套方案和项目当前实现是最贴合的，不需要额外魔改项目逻辑。
+- 注册机
+- 自动化收验证码
+- 测试环境收信
+- 一次性别名邮箱
+- 内部通知系统
 
 ---
 
-## 二十、给第一次配置的人一个最简单的理解方式
+## 二十五、作为示例：怎么接进本仓库项目
 
-如果你还是觉得前面信息很多，可以把这件事理解成下面这句话：
+虽然本文是通用教程，但顺手给一个仓库内示例，方便你对照理解。
 
-### Cloudflare 是前台，Worker 是收件员，D1 是仓库，项目是取件的人。
-
-它们分别做的事是：
-
-- Cloudflare：把发到你域名上的邮件接住
-- Worker：把邮件拆开，保存下来
-- D1：存邮件内容
-- 项目：按邮箱地址去查最新邮件
-
-只要这个分工想明白了，后面整个配置就不难了。
-
----
-
-## 二十一、项目配置示例汇总
-
-### 单域名
+如果你要把这套通用方案接进本仓库项目，项目里主要读取的是这些环境变量：
 
 ```env
 EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=your-super-long-random-token
-EMAIL_DOMAIN=tvmail.example.com
+EMAIL_API_URL=https://mail-gateway-api.xxx.workers.dev
+EMAIL_API_TOKEN=your-worker-token
+EMAIL_DOMAIN=signup.example.com
 ```
 
-### 多域名
+如果你准备多个域名，也可以：
 
 ```env
 EMAIL_PROVIDER=cloudflare
-EMAIL_API_URL=https://tavily-mail-api.xxx.workers.dev
-EMAIL_API_TOKEN=your-super-long-random-token
-EMAIL_DOMAINS=tvmail.example.com,keys.example.com
+EMAIL_API_URL=https://mail-gateway-api.xxx.workers.dev
+EMAIL_API_TOKEN=your-worker-token
+EMAIL_DOMAINS=signup.example.com,verify.example.com
 ```
+
+在这个仓库里，它们最终会驱动：
+
+- 生成随机邮箱地址
+- 调用你自己的 `/messages` API
+- 提取验证码和验证链接
+
+但这只是本文的一个应用场景，不是本文的前提。
 
 ---
 
-## 二十二、参考资料
+## 二十六、官方参考资料
 
-如果你想进一步对照官方文档，可以看这些 Cloudflare 文档：
+下面这些是这次改写时重点对照的 Cloudflare 官方文档：
 
+- [Overview](https://developers.cloudflare.com/email-routing/)
 - [Enable Email Routing](https://developers.cloudflare.com/email-routing/get-started/enable-email-routing/)
-- [Email Routing Addresses and Rules](https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/)
-- [Email Routing Subdomains](https://developers.cloudflare.com/email-routing/setup/subdomains/)
-- [Email Routing DNS Records](https://developers.cloudflare.com/email-routing/setup/email-routing-dns-records/)
+- [Configure Rules and Addresses](https://developers.cloudflare.com/email-routing/setup/email-routing-addresses/)
+- [Subdomains](https://developers.cloudflare.com/email-routing/setup/subdomains/)
 - [Enable Email Workers](https://developers.cloudflare.com/email-routing/email-workers/enable-email-workers/)
-- [Email Workers Runtime API](https://developers.cloudflare.com/email-routing/email-workers/runtime-api/)
-- [Troubleshooting SPF records](https://developers.cloudflare.com/email-routing/troubleshooting/email-routing-spf-records/)
+- [Email Workers](https://developers.cloudflare.com/email-routing/email-workers/)
+- [Runtime API](https://developers.cloudflare.com/email-routing/email-workers/runtime-api/)
+- [Limits](https://developers.cloudflare.com/email-routing/limits/)
 - [Test Email Routing](https://developers.cloudflare.com/email-routing/get-started/test-email-routing/)
 
 ---
 
-## 二十三、最后的建议
+## 二十七、最后一句最实用的话
 
-如果你只是想尽快把项目跑起来，不要一开始就做太多扩展。
+如果你想搭一套真正能长期复用的“无限别名域名邮箱”系统，最稳的方案不是：
 
-先按最小可用方案完成下面这些事：
+“在后台手工建一堆邮箱”
 
-1. 一个子域名
-2. 一个 Catch-all
-3. 一个 Worker
-4. 一个 D1
-5. 一个 `/messages` 接口
+而是：
 
-先把这条链跑通，再考虑：
+### Cloudflare Email Routing + Catch-all + Email Worker + 一个你自己的读取接口
 
-- 多域名轮换
-- 邮件自动清理
-- 旧邮件保留策略
-- 控制台可视化
-- 统计与监控
-
-这样最稳，也最不容易把自己绕进去。
+这套东西一旦搭好，后面无论你是给注册脚本、测试平台、自动化系统、通知中心，还是像本仓库这种项目接入，都可以直接复用。

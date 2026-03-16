@@ -13,7 +13,7 @@ The old unstable script flow has been replaced with a single unified pipeline:
 
 The goal of this rebuild is simple: make the Tavily / Auth0 / Cloudflare registration flow usable, repeatable, concurrent, and suitable for unattended background execution.
 
-For a complete step-by-step Cloudflare domain mail setup guide, see:
+For a general Cloudflare unlimited-alias domain mail guide, see:
 [Cloudflare Mail Setup Guide](./docs/Cloudflare-Mail-Setup-Guide.md)
 
 ## Features
